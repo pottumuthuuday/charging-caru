@@ -139,92 +139,109 @@
   }
 
   /* ==========================================================================
-     3. Frame Cache & Preloader Architecture
+     3. Frame Cache & Robust Loading Architecture
      ========================================================================== */
   class FrameSequence {
-    constructor(options) {
+    constructor(options, name = '') {
+      this.name = name;
+      this.options = options;
       this.frameCount = options.frameCount;
       this.getDesktopPath = options.desktopPath;
       this.getMobilePath = options.mobilePath;
-      this.images = new Array(this.frameCount);
-      this.loadedIndices = new Set();
+      this.images = new Map(); // index -> HTMLImageElement
+      this.loadingPromises = new Map(); // index -> Promise
       this.isMobile = window.innerWidth < 768;
+      this.listeners = new Set();
 
       window.addEventListener('resize', () => {
         const nowMobile = window.innerWidth < 768;
         if (nowMobile !== this.isMobile) {
           this.isMobile = nowMobile;
-          // Reload frames for new viewport mode
-          this.reloadAll();
+          this.images.clear();
+          this.loadingPromises.clear();
+          this.notifyChange();
         }
       }, { passive: true });
     }
 
+    onFrameLoaded(cb) {
+      this.listeners.add(cb);
+    }
+
+    notifyChange() {
+      this.listeners.forEach((cb) => cb());
+    }
+
     getPath(index) {
-      return this.isMobile ? this.getMobilePath(index) : this.getDesktopPath(index);
+      const relPath = this.isMobile ? this.getMobilePath(index) : this.getDesktopPath(index);
+      return new URL(relPath, document.baseURI || window.location.href).href;
     }
 
     loadFrame(index) {
-      const i = index - 1;
-      if (this.images[i]) return Promise.resolve(this.images[i]);
+      const idx = clamp(index, 1, this.frameCount);
+      if (this.images.has(idx)) {
+        return Promise.resolve(this.images.get(idx));
+      }
+      if (this.loadingPromises.has(idx)) {
+        return this.loadingPromises.get(idx);
+      }
 
-      return new Promise((resolve) => {
+      const promise = new Promise((resolve) => {
         const img = new Image();
-        img.src = this.getPath(index);
+        img._frameIndex = idx;
+        img.src = this.getPath(idx);
         img.onload = () => {
           if (img.decode) {
             img.decode().catch(() => {}).finally(() => {
-              this.images[i] = img;
-              this.loadedIndices.add(index);
+              this.images.set(idx, img);
+              this.loadingPromises.delete(idx);
+              this.notifyChange();
               resolve(img);
             });
           } else {
-            this.images[i] = img;
-            this.loadedIndices.add(index);
+            this.images.set(idx, img);
+            this.loadingPromises.delete(idx);
+            this.notifyChange();
             resolve(img);
           }
         };
         img.onerror = () => {
-          console.warn(`Failed to load frame ${index}`);
+          console.warn(`[${this.name}] Failed to load frame ${idx} from ${img.src}`);
+          this.loadingPromises.delete(idx);
           resolve(null);
         };
       });
+
+      this.loadingPromises.set(idx, promise);
+      return promise;
     }
 
-    async loadRange(start, end, onProgress) {
-      let loaded = 0;
-      const total = end - start + 1;
+    // Proactively load a window of frames around centerIndex
+    loadWindow(centerIndex, backward = 4, forward = 10) {
+      const start = clamp(centerIndex - backward, 1, this.frameCount);
+      const end = clamp(centerIndex + forward, 1, this.frameCount);
+      this.loadFrame(centerIndex);
       for (let i = start; i <= end; i++) {
-        await this.loadFrame(i);
-        loaded++;
-        if (onProgress) onProgress(loaded, total, i);
-      }
-    }
-
-    reloadAll() {
-      const loaded = Array.from(this.loadedIndices);
-      this.images = new Array(this.frameCount);
-      this.loadedIndices.clear();
-      // Refetch already requested frames in background
-      for (const idx of loaded) {
-        this.loadFrame(idx);
+        if (i !== centerIndex) {
+          this.loadFrame(i);
+        }
       }
     }
 
     getNearestFrame(targetIndex) {
       const clamped = clamp(targetIndex, 1, this.frameCount);
-      if (this.loadedIndices.has(clamped)) {
-        return this.images[clamped - 1];
+      if (this.images.has(clamped)) {
+        return this.images.get(clamped);
       }
 
       // Search outwards for nearest loaded frame
       let dist = 1;
       while (clamped - dist >= 1 || clamped + dist <= this.frameCount) {
-        if (clamped - dist >= 1 && this.loadedIndices.has(clamped - dist)) {
-          return this.images[clamped - dist - 1];
+        if (clamped - dist >= 1 && this.images.has(clamped - dist)) {
+          return this.images.get(clamped - dist);
         }
-        if (clamped + dist <= this.frameCount && this.loadedIndices.has(clamped + dist)) {
-          return this.images[clamped + dist - 1];
+        if (clamped + dist <= this.frameCount && this.images.has(clamped + dist)) {
+          return this.images.get(clamped + dist);
         }
         dist++;
       }
@@ -232,24 +249,35 @@
     }
   }
 
-  const heroSequence = new FrameSequence(cfg.hero);
-  const dismantleSequence = new FrameSequence(cfg.dismantle);
+  const heroSequence = new FrameSequence(cfg.hero, 'hero');
+  const dismantleSequence = new FrameSequence(cfg.dismantle, 'dismantle');
 
-  /* Preloader Logic: Load 1-40 Hero frames first */
+  /* Preloader Logic: Preload opening frames of BOTH Hero and Dismantle */
   async function runPreloader() {
     const preloader = document.getElementById('preloader');
     const line = document.getElementById('preloader-line');
     const counter = document.getElementById('preloader-counter');
 
-    const initialBatch = cfg.preload.heroInitialBatch || 40;
-    let currentPct = 0;
+    const heroBatch = cfg.preload.heroInitialBatch || 40;
+    const dismantleInitialBatch = 20; // Preload opening dismantle frames concurrently!
+    const totalInitial = heroBatch + dismantleInitialBatch;
+    let loadedCount = 0;
 
-    await heroSequence.loadRange(1, initialBatch, (loaded, total) => {
-      const targetPct = Math.round((loaded / total) * 100);
-      currentPct = targetPct;
-      if (line) line.style.width = `${targetPct}%`;
-      if (counter) counter.textContent = String(targetPct).padStart(3, '0');
-    });
+    const updateUI = () => {
+      const pct = Math.min(100, Math.round((loadedCount / totalInitial) * 100));
+      if (line) line.style.width = `${pct}%`;
+      if (counter) counter.textContent = String(pct).padStart(3, '0');
+    };
+
+    const initialLoads = [];
+    for (let i = 1; i <= heroBatch; i++) {
+      initialLoads.push(heroSequence.loadFrame(i).then(() => { loadedCount++; updateUI(); }));
+    }
+    for (let i = 1; i <= dismantleInitialBatch; i++) {
+      initialLoads.push(dismantleSequence.loadFrame(i).then(() => { loadedCount++; updateUI(); }));
+    }
+
+    await Promise.all(initialLoads);
 
     // Bright flash on completion
     if (line) line.classList.add('is-complete');
@@ -263,19 +291,36 @@
     const heroCh1 = document.getElementById('hero-ch-1');
     if (heroCh1) heroCh1.classList.add('is-active');
 
-    // Background preload: remaining hero frames, then dismantle frames
+    // Background preload: Interleaved concurrency-limited loader for Hero & Dismantle
     (async () => {
-      for (let i = initialBatch + 1; i <= heroSequence.frameCount; i++) {
-        await heroSequence.loadFrame(i);
-        // Yield to browser occasionally
-        if (i % 25 === 0) await new Promise((r) => setTimeout(r, 16));
+      const queue = [];
+      const maxLen = Math.max(heroSequence.frameCount, dismantleSequence.frameCount);
+      
+      // Interleave dismantle and hero frames so neither starves
+      for (let i = 1; i <= maxLen; i++) {
+        if (i <= dismantleSequence.frameCount && !dismantleSequence.images.has(i)) {
+          queue.push(() => dismantleSequence.loadFrame(i));
+        }
+        if (i <= heroSequence.frameCount && !heroSequence.images.has(i)) {
+          queue.push(() => heroSequence.loadFrame(i));
+        }
       }
 
-      // Then load dismantle frames
-      for (let i = 1; i <= dismantleSequence.frameCount; i++) {
-        await dismantleSequence.loadFrame(i);
-        if (i % 25 === 0) await new Promise((r) => setTimeout(r, 16));
+      const concurrency = 6;
+      let active = 0;
+      let index = 0;
+
+      function processQueue() {
+        while (active < concurrency && index < queue.length) {
+          const task = queue[index++];
+          active++;
+          task().finally(() => {
+            active--;
+            processQueue();
+          });
+        }
       }
+      processQueue();
     })();
   }
 
@@ -307,7 +352,7 @@
     ctx.drawImage(img, drawX, drawY, drawW, drawH);
   }
 
-  /* Scrollytelling Controller */
+  /* Scrollytelling Controller with Reactive Frame Updates */
   class ScrollyCanvas {
     constructor(wrapperEl, canvasEl, sequence, onProgressUpdate) {
       this.wrapper = wrapperEl;
@@ -318,12 +363,19 @@
 
       this.currentFrame = 1;
       this.targetFrame = 1;
-      this.lastDrawnFrame = -1;
+      this.lastDrawnImg = null;
+      this.lastDrawnTargetIndex = -1;
       this.progress = 0;
+      this.needsRedraw = true;
 
       this.dpr = Math.min(window.devicePixelRatio || 1, 2);
       this.width = 0;
       this.height = 0;
+
+      // Automatically request redraw whenever any frame finishes loading
+      this.sequence.onFrameLoaded(() => {
+        this.needsRedraw = true;
+      });
 
       this.initResize();
     }
@@ -338,7 +390,7 @@
         this.canvas.height = Math.round(rect.height * this.dpr);
         this.ctx.setTransform(1, 0, 0, 1, 0, 0);
         this.ctx.scale(this.dpr, this.dpr);
-        this.lastDrawnFrame = -1; // force redraw
+        this.needsRedraw = true;
       };
 
       window.addEventListener('resize', handleResize, { passive: true });
@@ -353,6 +405,9 @@
       this.progress = clamp(-rect.top / scrollDist, 0, 1);
       this.targetFrame = Math.round(this.progress * (this.sequence.frameCount - 1)) + 1;
 
+      // Immediately prioritize on-demand loading of the current target frame window!
+      this.sequence.loadWindow(this.targetFrame, 5, 12);
+
       if (this.onProgressUpdate) {
         this.onProgressUpdate(this.progress, this.targetFrame);
       }
@@ -363,15 +418,20 @@
       this.currentFrame = lerp(this.currentFrame, this.targetFrame, 0.15);
       const roundedFrame = Math.round(this.currentFrame);
 
-      if (roundedFrame !== this.lastDrawnFrame) {
-        const frameImg = this.sequence.getNearestFrame(roundedFrame);
-        if (frameImg) {
-          // Fill background solid --asphalt
-          this.ctx.fillStyle = '#07080A';
-          this.ctx.fillRect(0, 0, this.width, this.height);
-          drawImageFit(this.ctx, frameImg, this.width, this.height);
-          this.lastDrawnFrame = roundedFrame;
-        }
+      const frameImg = this.sequence.getNearestFrame(roundedFrame);
+
+      // Redraw if target frame index changed, or new closer frame image arrived, or needsRedraw flag set
+      const shouldRedraw = this.needsRedraw || 
+                           roundedFrame !== this.lastDrawnTargetIndex || 
+                           frameImg !== this.lastDrawnImg;
+
+      if (shouldRedraw && frameImg) {
+        this.ctx.fillStyle = '#07080A';
+        this.ctx.fillRect(0, 0, this.width, this.height);
+        drawImageFit(this.ctx, frameImg, this.width, this.height);
+        this.lastDrawnImg = frameImg;
+        this.lastDrawnTargetIndex = roundedFrame;
+        this.needsRedraw = false;
       }
     }
   }
@@ -384,6 +444,10 @@
     const heroCanvas = document.getElementById('hero-canvas');
     const blackoutEl = document.getElementById('hero-blackout');
     const progressLine = document.getElementById('hero-progress-line');
+
+    if (heroWrapper && cfg.hero.wrapperHeight) {
+      heroWrapper.style.height = cfg.hero.wrapperHeight;
+    }
 
     const hudChapter = document.getElementById('hud-chapter-text');
     const hudSpeed = document.getElementById('hud-speed');
@@ -488,6 +552,10 @@
     const dismantleCanvas = document.getElementById('dismantle-canvas');
     const progressLine = document.getElementById('dismantle-progress-line');
     const calloutsContainer = document.getElementById('dismantle-callouts');
+
+    if (dismantleWrapper && cfg.dismantle.wrapperHeight) {
+      dismantleWrapper.style.height = cfg.dismantle.wrapperHeight;
+    }
 
     const calloutElements = cfg.dismantle.callouts.map((c) => {
       const el = document.getElementById(c.id);
